@@ -1,4 +1,7 @@
-use std::net::TcpListener;
+use std::{
+    io::{prelude::*, BufReader},
+    net::{TcpListener, TcpStream}
+};
 use anyhow::Result;
 
 fn main() -> Result<()> {
@@ -10,7 +13,7 @@ fn main() -> Result<()> {
         will produce an error until some of the open connections are closed.
      */
     for stream in listener.incoming() {
-        println!("Connection established: {:?}", stream?);
+        handle_connection(stream?);
     }
     /*
         When stream goes out of scope and is dropped at the end of the loop,
@@ -18,4 +21,17 @@ fn main() -> Result<()> {
      */
 
     Ok(())
+}
+
+fn handle_connection(mut stream: TcpStream) {
+    let reader = BufReader::new(&mut stream);
+    let http_request: Vec<_> = reader
+        .lines()
+        .map(|result| result.unwrap())
+        .take_while(|line| !line.is_empty())
+        .collect();
+
+    let response = "HTTP/1.1 200 OK\r\n\r\n";
+
+    stream.write_all(response.as_bytes()).unwrap()
 }
