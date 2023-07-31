@@ -8,6 +8,8 @@
 use std::fmt::{Display, Formatter};
 use std::{sync::{mpsc, Arc, Mutex}, thread};
 
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
 // cargo doc --open
 pub struct ThreadPool {
     workers: Vec<Worker>,
@@ -39,6 +41,7 @@ impl ThreadPool {
          */
         let mut workers = Vec::with_capacity(size);
 
+        // we clone the Arc to bump the reference count so the workers can share ownership of the receiver
         (0..size).for_each(|id|
             workers.push(
                 Worker::new(
@@ -61,11 +64,19 @@ impl ThreadPool {
         if you also need it to not mutate state, use Fn.
      */
     pub fn execute<F>(&self, f: F)
-    where F: FnOnce() + Send + 'static {
+    where F: FnOnce() + Send + 'static
+    {
+        let job = Box::new(f);
+        /*
+            We’re calling unwrap on send for the case that sending fails. This might happen if, for
+            example, we stop all our threads from executing, meaning the receiving end has stopped
+            receiving new messages. At the moment, we can’t stop our threads from executing: our
+            threads continue executing as long as the pool exists. The reason we use unwrap is that
+            we know the failure case won’t happen, but the compiler doesn’t know that.
+         */
+        self.sender.send(job).unwrap()
     }
 }
-
-struct Job;
 
 struct Worker {
     id: usize,
@@ -73,8 +84,24 @@ struct Worker {
 }
 impl Worker {
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Self {
-        let thread = thread::spawn(|| {
-            receiver;
+        let thread = thread::spawn(move || loop {
+            /*
+                We first call lock on the receiver to acquire the mutex, and then we call unwrap to
+                panic on any errors. Acquiring a lock might fail if the mutex is in a poisoned state,
+                which can happen if some other thread panicked while holding the lock rather than
+                releasing the lock. In this situation, calling unwrap to have this thread panic is
+                the correct action to take. Feel free to change this unwrap to an expect with an
+                error message that is meaningful to you.
+             */
+            let job = receiver
+                .lock()
+                .expect("Mutex poisoned: Another thread panicked while holding the lock.")
+                .recv()
+                .expect("The thread holding the sender has shut down.");
+
+            println!("Worker {id} got a job; executing...");
+
+            job();
         });
 
         Self {
