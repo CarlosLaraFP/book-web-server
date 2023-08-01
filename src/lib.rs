@@ -13,7 +13,7 @@ type Job = Box<dyn FnOnce() + Send + 'static>;
 // cargo doc --open
 pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>
+    sender: Option<mpsc::Sender<Job>>
 }
 
 impl ThreadPool {
@@ -52,7 +52,7 @@ impl ThreadPool {
         );
 
         Ok(
-            ThreadPool { workers, sender }
+            ThreadPool { workers, sender: Some(sender) }
         )
     }
 
@@ -63,10 +63,9 @@ impl ThreadPool {
         need to call it once. If you need to call the parameter repeatedly, use FnMut as a bound;
         if you also need it to not mutate state, use Fn.
      */
-    pub fn execute<F>(&self, f: F)
+    pub fn execute<F>(&self, job: F)
     where F: FnOnce() + Send + 'static
     {
-        let job = Box::new(f);
         /*
             We’re calling unwrap on send for the case that sending fails. This might happen if, for
             example, we stop all our threads from executing, meaning the receiving end has stopped
@@ -74,15 +73,41 @@ impl ThreadPool {
             threads continue executing as long as the pool exists. The reason we use unwrap is that
             we know the failure case won’t happen, but the compiler doesn’t know that.
          */
-        self.sender.send(job).unwrap()
+        self.sender
+            .as_ref()
+            .unwrap()
+            .send(Box::new(job))
+            .unwrap()
+        // there is a single instance of the receiver that receives these jobs (messages)
     }
 }
 
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        /*
+            Dropping sender closes the channel, which indicates no more messages will be sent.
+            When that happens, all the calls to recv that the workers do in the infinite
+            loop will return an error.
+         */
+        drop(self.sender.take());
+
+        for worker in &mut self.workers {
+            println!("Shutting down worker {}", worker.id);
+
+            if let Some(thread) = worker.thread.take() {
+                thread.join().unwrap();
+            }
+        }
+    }
+}
+
+
 struct Worker {
     id: usize,
-    thread: thread::JoinHandle<()>
+    thread: Option<thread::JoinHandle<()>>
 }
 impl Worker {
+    // each worker loops forever, attempting to read messages from the receiver singleton
     fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Job>>>) -> Self {
         let thread = thread::spawn(move || loop {
             /*
@@ -93,20 +118,41 @@ impl Worker {
                 the correct action to take. Feel free to change this unwrap to an expect with an
                 error message that is meaningful to you.
              */
-            let job = receiver
+            /*
+                With let, any temporary values used in the expression on the right hand side of the
+                equals sign are immediately dropped when the let statement ends. However, while let
+                (and if let and match) does not drop temporary values until the end of the
+                associated block. In the example below, the lock remains held for the duration
+                of the call to job(), meaning other workers cannot receive jobs.
+
+                while let Ok(job) = receiver.lock().unwrap().recv() {
+                    println!("Worker {id} got a job; executing.");
+
+                    job();
+                }
+             */
+            let message = receiver
                 .lock()
                 .expect("Mutex poisoned: Another thread panicked while holding the lock.")
-                .recv()
-                .expect("The thread holding the sender has shut down.");
+                .recv(); // blocks the given thread until a message is received or the thread holding the sender shuts down
 
-            println!("Worker {id} got a job; executing...");
+            // lock automatically released
 
-            job();
+            match message {
+                Ok(job) => {
+                    println!("Worker {id} got a job; executing.");
+                    job();
+                }
+                Err(_) => {
+                    println!("Worker {id} disconnected; shutting down.");
+                    break;
+                }
+            }
         });
 
         Self {
             id,
-            thread
+            thread: Some(thread)
         }
     }
 }

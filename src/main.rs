@@ -11,7 +11,11 @@ type Result = anyhow::Result<()>;
 
 fn main() -> Result {
     let listener = TcpListener::bind("127.0.0.1:7878")?;
-    // Compiler Driven Development
+    /*
+        There are never more than four threads created, so our system won’t get overloaded if the
+        server receives a lot of requests. If we make a request to /sleep, the server will be able
+        to serve other requests by having another thread run them.
+     */
     let thread_pool = ThreadPool::build(4)?;
 
     /*
